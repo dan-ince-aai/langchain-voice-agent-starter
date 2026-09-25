@@ -1,5 +1,6 @@
-# The Voice Agents backend SDK.
-assemblyai-agents @ git+https://github.com/dan-ince-aai/assemblyai-agents-python.git@main
+# The Voice Agents backend SDK. `[audio]` is the microphone and speaker for
+# call.py; it needs PortAudio first (macOS: brew install portaudio).
+assemblyai-agents[audio] @ git+https://github.com/dan-ince-aai/assemblyai-agents-python.git@main
 
 # The text agent.
 langchain>=1.0

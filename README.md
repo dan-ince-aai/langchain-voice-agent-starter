@@ -21,7 +21,7 @@ same way.
 ./setup.sh                                   # needs Python 3.11+ and ngrok
 # put your AssemblyAI API key in .env
 .venv/bin/python run.py                      # you're live
-.venv/bin/python call.py "weather in Lisbon" # call it from another terminal
+.venv/bin/python call.py                     # talk to it — mic in, speaker out
 ```
 
 One key does everything. Add a real phone number with `python phone.py buy GB`.
@@ -62,5 +62,5 @@ Silence on a phone sounds like a dropped call. This is how you avoid it.
 | `agent.py` | Your agent. The only file you'd rewrite. |
 | `voice.py` | Voice, greeting, platform tools. |
 | `run.py` | Tunnel, deploy, serve. |
-| `call.py` | Test it without a phone. |
+| `call.py` | Talk to it from your laptop. |
 | `phone.py` | Buy or attach a number. |
