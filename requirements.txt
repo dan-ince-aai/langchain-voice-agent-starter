@@ -1,0 +1,8 @@
+# The Voice Agents backend SDK.
+assemblyai-agents @ git+https://github.com/dan-ince-aai/assemblyai-agents-python.git@main
+
+# The text model that decides each turn.
+pydantic-ai>=2.0
+
+# Used by the weather tool.
+httpx>=0.28
