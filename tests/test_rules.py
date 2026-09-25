@@ -1,50 +1,44 @@
-"""The loop around the model, with the model taken out.
-
-No key, no network. `propose` is replaced with a stand-in, so what these pin
-is the agent's behaviour when the model is wrong, slow, or broken — which is
-the part that makes it an agent rather than a gateway.
-
-    .venv/bin/python -m pytest -q tests/test_rules.py
-"""
+"""Graph behaviour with `propose` stubbed. No API key or network required."""
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import agent  # noqa: E402
 from agent import Decision, audit, fresh  # noqa: E402
+from assemblyai_agents.byo import Say, Turn  # noqa: E402
 
 LISBON = {"lisbon": {"found": True, "place": "Lisbon", "celsius": 21.4, "description": "overcast"}}
 
 
-# --------------------------------------------------------------- the rules
+# audit
 
 
-def test_a_temperature_with_nothing_looked_up_is_rejected():
+def test_temperature_without_lookup_is_rejected():
     assert audit(Decision(action="speak", text="It's twenty degrees in Lisbon."), known={})
 
 
-def test_a_temperature_from_a_real_lookup_passes():
+def test_temperature_with_lookup_is_accepted():
     assert audit(Decision(action="speak", text="It's twenty-one degrees in Lisbon."), known=LISBON) == []
 
 
-def test_a_known_place_is_not_looked_up_again():
-    assert audit(Decision(action="check_weather", location="Lisbon", filler="One moment."), known=LISBON)
+def test_known_place_is_not_looked_up_again():
+    assert audit(Decision(action="check_weather", location="Lisbon", filler="x"), known=LISBON)
 
 
-def test_a_new_place_is_looked_up():
-    assert audit(Decision(action="check_weather", location="Porto", filler="Checking Porto."), known=LISBON) == []
+def test_new_place_is_looked_up():
+    assert audit(Decision(action="check_weather", location="Porto", filler="x"), known=LISBON) == []
 
 
-def test_a_missing_filler_is_supplied_not_rejected():
+def test_missing_filler_is_defaulted():
     proposal = Decision(action="check_weather", location="Lisbon")
-
     assert audit(proposal, known={}) == []
     assert "Lisbon" in proposal.filler
 
 
-def test_a_lookup_with_no_place_is_rejected():
+def test_lookup_without_location_is_rejected():
     assert audit(Decision(action="check_weather", location="  "), known={})
 
 
@@ -52,16 +46,16 @@ def test_markdown_is_rejected():
     assert audit(Decision(action="speak", text="**Lisbon**: overcast"), known=LISBON)
 
 
-def test_an_empty_answer_is_rejected():
+def test_empty_text_is_rejected():
     assert audit(Decision(action="speak", text=""), known={})
 
 
-# --------------------------------------------------------------- the loop
+# graph
 
 
-def test_a_corrected_second_proposal_is_spoken(monkeypatch):
+def test_rejected_proposal_is_retried(monkeypatch):
     proposals = iter([
-        Decision(action="speak", text="It's thirty degrees."),   # invented: nothing looked up
+        Decision(action="speak", text="It's thirty degrees."),
         Decision(action="speak", text="Which place would you like?"),
     ])
     monkeypatch.setattr(agent, "propose", lambda messages: next(proposals))
@@ -72,21 +66,21 @@ def test_a_corrected_second_proposal_is_spoken(monkeypatch):
     assert out["attempts"] == 2
 
 
-def test_the_rejection_reason_reaches_the_second_attempt(monkeypatch):
+def test_rejection_reason_is_passed_to_retry(monkeypatch):
     seen = []
 
-    def stand_in(messages):
+    def stub(messages):
         seen.append(messages)
         return Decision(action="speak", text="It's thirty degrees.")
 
-    monkeypatch.setattr(agent, "propose", stand_in)
+    monkeypatch.setattr(agent, "propose", stub)
     agent.graph.invoke(fresh("Caller: hi", known={}))
 
     assert len(seen) == 2
     assert "rejected" in seen[1][-1][1]
 
 
-def test_two_bad_proposals_become_the_fallback(monkeypatch):
+def test_repeated_rejection_falls_back(monkeypatch):
     monkeypatch.setattr(agent, "propose", lambda messages: Decision(action="speak", text="It's thirty degrees."))
 
     out = agent.graph.invoke(fresh("Caller: hi", known={}))
@@ -95,29 +89,21 @@ def test_two_bad_proposals_become_the_fallback(monkeypatch):
     assert out["attempts"] == agent.MAX_ATTEMPTS
 
 
-def test_a_model_failure_is_a_sentence_not_silence(monkeypatch):
-    def broken(messages):
+def test_model_exception_falls_back(monkeypatch):
+    def stub(messages):
         raise RuntimeError("gateway down")
 
-    monkeypatch.setattr(agent, "propose", broken)
+    monkeypatch.setattr(agent, "propose", stub)
 
-    out = agent.graph.invoke(fresh("Caller: hi", known={}))
-
-    assert out["proposal"].text == agent.FALLBACK
+    assert agent.graph.invoke(fresh("Caller: hi", known={}))["proposal"].text == agent.FALLBACK
 
 
-def test_a_hung_model_is_a_sentence_within_the_budget(monkeypatch):
-    import time
-
-    def hung(messages):
-        time.sleep(30)
-
-    monkeypatch.setattr(agent, "propose", hung)
+def test_timeout_falls_back_within_budget(monkeypatch):
+    monkeypatch.setattr(agent, "propose", lambda messages: time.sleep(30))
     monkeypatch.setattr(agent, "REPLY_BUDGET_SECONDS", 0.2)
-    from assemblyai_agents.byo import Say, Turn
-
     turn = Turn.from_request({"model": "weather-line", "stream": True, "tools": [],
                               "messages": [{"role": "user", "content": "hi"}]})
+
     started = time.perf_counter()
     answer = agent.reply(turn)
 

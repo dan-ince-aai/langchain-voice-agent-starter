@@ -1,12 +1,9 @@
-"""The voice in front of the agent: the platform's configuration, and the one
-tool the platform runs rather than the agent.
+"""Platform configuration: voice, greeting, and platform-hosted tools.
 
-The weather lookup is here and not in `agent.py` for one reason: it is slow.
-Two network calls is a couple of seconds of silence on a phone line. A tool
-declared here runs on the platform, which means the agent can hand back a
-sentence to speak in the same response as the call — see `reply()` — so the
-caller hears "let me check Lisbon for you" while the lookup is in flight.
-Anything fast belongs in the agent instead.
+`get_weather` is declared here as a platform tool rather than as a LangChain
+tool so that `reply()` can return speech in the same response as the tool call
+(`call_tool(..., saying=...)`). Tools that complete quickly belong in
+`agent.py` instead.
 """
 
 import os
@@ -21,13 +18,13 @@ VOICE = os.environ.get("VOICE", "alba")
 
 @tool(timeout_seconds=15)
 async def get_weather(location: str) -> dict:
-    """Look up the current weather somewhere.
+    """Current weather for a place.
 
     Args:
-        location: The town or city the caller named, like "Lisbon".
+        location: Town or city name as spoken by the caller.
     """
-    # A tool that raises answers the platform with a 500, which the caller hears
-    # as silence. Returning the failure instead lets the agent say something.
+    # Return failures rather than raising: an exception becomes a 500 and the
+    # caller hears nothing.
     try:
         async with httpx.AsyncClient(timeout=10) as http:
             found = await http.get(
@@ -57,11 +54,11 @@ async def get_weather(location: str) -> dict:
         "country": place.get("country", ""),
         "celsius": now.get("temperature_2m"),
         "wind_kph": now.get("wind_speed_10m"),
-        "description": _CODES.get(now.get("weather_code"), "hard to describe"),
+        "description": _CODES.get(now.get("weather_code"), "unknown"),
     }
 
 
-# Open-Meteo returns a WMO code. The model reads the word, not the number.
+# WMO weather codes, as words for speech.
 _CODES = {
     0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
     45: "foggy", 48: "freezing fog", 51: "drizzling", 53: "drizzling",
@@ -75,13 +72,13 @@ TOOLS = [get_weather]
 
 
 def build(base_url: str) -> VoiceAgent:
-    """The agent as the platform will store it."""
+    """Agent definition as stored on the platform."""
     auth = {"name": "Authorization", "value": f"Bearer {SECRET}"}
     return VoiceAgent(
         name="Weather Line",
         voice=VOICE,
-        # Replaced on every turn by agent.py, so this only has to be true.
-        system_prompt="You are a friendly weather line.",
+        # Not used for generation: every turn is answered by agent.reply.
+        system_prompt="You are a weather line.",
         greeting="Weather line, which place would you like?",
         tools=[t.hosted_at(f"{base_url}/tools/{t.name}", headers=[auth]) for t in TOOLS],
         llm=LlmConfigRequest(base_url=f"{base_url}/v1", model="weather-line", api_key=SECRET),

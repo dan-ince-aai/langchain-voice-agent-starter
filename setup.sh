@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# One-time setup. Python 3.11 or newer.
+# Create the virtualenv and install dependencies. Requires Python 3.11+.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 if [[ "$OSTYPE" == darwin* ]] && ! brew list portaudio >/dev/null 2>&1; then
-  echo "call.py needs PortAudio for the microphone:  brew install portaudio"
+  echo "PortAudio is required for call.py: brew install portaudio"
 fi
 
 python3 -m venv .venv
@@ -14,5 +14,5 @@ python3 -m venv .venv
 [ -f .env ] || cp .env.example .env
 
 echo
-echo "Done. Put your key in .env, then:"
+echo "Set ASSEMBLYAI_API_KEY in .env, then:"
 echo "    .venv/bin/python run.py"

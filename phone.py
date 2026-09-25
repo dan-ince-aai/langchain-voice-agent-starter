@@ -1,11 +1,10 @@
-"""Put the agent on a real phone number.
+"""Phone number management for the deployed agent.
 
     python phone.py list          # numbers on this account
-    python phone.py buy GB        # buy one and point it at this agent
-    python phone.py attach +44…   # point a number you already own at it
+    python phone.py buy GB        # purchase a number and assign it to this agent
+    python phone.py attach +44…   # assign an existing number to this agent
 
-Buying a number costs money on your AssemblyAI account, so `buy` asks first.
-Everything else in this project is free to run.
+`buy` charges the account and asks for confirmation.
 """
 
 import sys
@@ -22,7 +21,7 @@ from run import ID_FILE, load_env
 
 def agent_id() -> str:
     if not ID_FILE.exists():
-        sys.exit("No .agent_id yet — run `python run.py` first.")
+        sys.exit("No .agent_id; run `python run.py` first.")
     return ID_FILE.read_text().strip()
 
 
@@ -33,14 +32,14 @@ def main() -> int:
 
     if command == "list":
         for number in api.phone_numbers.list():
-            mine = " <- this agent" if number.agent_id == agent_id() else ""
+            mine = "  (this agent)" if number.agent_id == agent_id() else ""
             print(f"  {number.phone_number}  agent={number.agent_id or '-'}{mine}")
         return 0
 
     if command == "buy":
         country = (sys.argv[2] if len(sys.argv) > 2 else "GB").upper()
-        print(f"Buying a {country} number and attaching it to {agent_id()}.")
-        if input("This charges your account. Type yes to continue: ").strip() != "yes":
+        print(f"Purchase a {country} number and assign it to {agent_id()}.")
+        if input("This charges the account. Type yes to continue: ").strip() != "yes":
             return 1
         bought = api.phone_numbers.purchase_available(
             PurchaseAvailablePhoneNumberRequest(
@@ -50,15 +49,13 @@ def main() -> int:
                 label="weather line",
             )
         )
-        print(f"  bought {bought.phone_number} — call it.")
+        print(f"  {bought.phone_number}")
         return 0
 
     if command == "attach":
         number = sys.argv[2]
-        api.phone_numbers.assign_agent(
-            number, PhoneNumberAssignAgentRequest(agent_id=agent_id())
-        )
-        print(f"  {number} now rings this agent.")
+        api.phone_numbers.assign_agent(number, PhoneNumberAssignAgentRequest(agent_id=agent_id()))
+        print(f"  {number} -> {agent_id()}")
         return 0
 
     sys.exit(__doc__)

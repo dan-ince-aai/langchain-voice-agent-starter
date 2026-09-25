@@ -1,10 +1,10 @@
-"""Start everything: a public address, the agent, and this process serving it.
+"""Start the agent locally.
 
     python run.py
 
-The platform reaches your laptop over HTTPS -- a phone call has no client on
-the other end for it to ask -- so this opens an ngrok tunnel, points a stored
-agent at it, and serves the tool and the reply endpoint on the same port.
+Opens an ngrok tunnel (unless PUBLIC_BASE_URL is set), creates or updates the
+agent on the platform with that address, and serves the tool and reply
+endpoints on PORT.
 """
 
 import contextlib
@@ -33,9 +33,9 @@ def load_env() -> None:
 
 @contextlib.contextmanager
 def tunnel(port: int):
-    """A public HTTPS address for `port`, for as long as the block runs.
+    """Public HTTPS address for `port` for the duration of the block.
 
-    `PUBLIC_BASE_URL` skips this entirely, for a staging host or a real deploy.
+    Set PUBLIC_BASE_URL to skip ngrok.
     """
     if os.environ.get("PUBLIC_BASE_URL"):
         yield os.environ["PUBLIC_BASE_URL"].rstrip("/")
@@ -50,16 +50,15 @@ def tunnel(port: int):
         if not address:
             raise SystemExit("ngrok did not come up. Is it installed and authenticated?")
         print(f"tunnel  {address} -> :{port}")
-        # Outside the retry loop on purpose: an exception raised by the body of
-        # the `with` is thrown back in at the yield, and a broad `except` around
-        # it would swallow the caller's error and start another tunnel.
+        # Keep the yield outside the retry loop: an exception from the `with`
+        # body is raised at the yield and must not be caught by the retry.
         yield address
     finally:
         process.terminate()
 
 
 def _ngrok_address() -> str:
-    """The https address of the running tunnel, once it has one."""
+    """HTTPS address of the local ngrok tunnel, polling until available."""
     for _ in range(40):
         time.sleep(0.5)
         try:
@@ -73,7 +72,7 @@ def _ngrok_address() -> str:
 
 
 def deploy(base_url: str) -> str:
-    """Create the agent, or update the one this project already made."""
+    """Create the agent, or update the one recorded in .agent_id."""
     from assemblyai_agents import Client, NotFoundError
 
     from voice import build
@@ -87,7 +86,7 @@ def deploy(base_url: str) -> str:
             print(f"agent   {stored} (updated)")
             return stored
         except NotFoundError:
-            print(f"agent   {stored} is gone, creating another")
+            print(f"agent   {stored} not found; creating")
     created = api.agents.create(declared)
     ID_FILE.write_text(created.id)
     print(f"agent   {created.id} (created)")
@@ -97,10 +96,7 @@ def deploy(base_url: str) -> str:
 def main() -> int:
     load_env()
     if not os.environ.get("ASSEMBLYAI_API_KEY"):
-        sys.exit(
-            "No ASSEMBLYAI_API_KEY.\n"
-            "  cp .env.example .env, then put your key in it."
-        )
+        sys.exit("ASSEMBLYAI_API_KEY is not set. Copy .env.example to .env and set it.")
     os.environ.setdefault("TOOL_SECRET", "local-dev-secret")
 
     from assemblyai_agents.serving import serve
@@ -112,8 +108,8 @@ def main() -> int:
         agent_id = deploy(base_url)
         secret = os.environ["TOOL_SECRET"]
         print(f"model   {agent.MODEL} via {agent.GATEWAY}")
-        print(f"\nTalk to it:  https://www.assemblyai.com/playground/voice-agent  (agent {agent_id})")
-        print("Or attach a phone number to that agent and call it.\n")
+        print(f"\nplayground: https://www.assemblyai.com/playground/voice-agent  (agent {agent_id})")
+        print("local mic:  python call.py\n")
         serve(
             voice.build(base_url),
             reply=agent.reply,

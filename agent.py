@@ -1,19 +1,18 @@
-"""Your agent. A LangGraph graph around the model, not a passthrough to it.
+"""LangGraph agent behind the reply endpoint.
 
-A bare model call is a gateway: whatever comes back gets spoken. An agent puts
-a loop around the model, and that loop is what a framework is for. This one has
-three steps:
+The platform POSTs an OpenAI-format chat completion request for each turn.
+`reply()` returns either speech (`say`) or a platform tool call (`call_tool`).
 
-  think     the model reasons, uses its own tools, and proposes a Decision
-  check     the proposal is held to rules the model cannot be trusted with —
-            no temperature it never looked up, no second lookup of a place it
-            already has, nothing that is not speakable
-  answer    a proposal that passes is spoken; one that fails goes back to think
-            with the reason; two failures, an error, or a hung model and the
-            caller gets a safe sentence instead of silence or an invention
+Graph:
 
-The platform asks what to say by POSTing an OpenAI-shaped chat request, and
-`reply()` answers it. Everything above is inside that one function.
+    think -> check -> END
+               |-> think     (rejected; reason appended; up to MAX_ATTEMPTS)
+               |-> fallback  (rejected MAX_ATTEMPTS times)
+
+`think` runs a LangChain agent with local tools and structured output.
+`check` validates the proposal with `audit()`. Model exceptions count as a
+failed attempt. `reply()` enforces a wall-clock budget; on timeout it returns
+the fallback response.
 """
 
 import json
@@ -33,52 +32,44 @@ from pydantic import BaseModel, Field
 GATEWAY = os.environ.get("LLM_GATEWAY", "https://llm-gateway.assemblyai.com/v1")
 MODEL = os.environ.get("MODEL", "claude-haiku-4-5-20251001")
 
-# The platform gives a reply endpoint about ten seconds. A model that has not
-# answered in eight is not going to; the caller gets a sentence, not a timeout.
+# The platform allows roughly 10s for a reply.
 REPLY_BUDGET_SECONDS = 8.0
 MAX_ATTEMPTS = 2
 FALLBACK = "Sorry, I missed that. Which place would you like the weather for?"
 
 
-# --------------------------------------------------------------- what a turn decides
-
-
 class Decision(BaseModel):
-    """One turn of the call: say something, or look somewhere up first."""
-
     action: Literal["speak", "check_weather"]
     text: str = Field(default="", description="For `speak`: one or two spoken sentences. No markdown.")
     location: str = Field(default="", description="For `check_weather`: the place, as the caller said it.")
     filler: str = Field(
         default="",
-        description='For `check_weather`: one short sentence spoken WHILE the lookup runs, naming the place. Like "Let me check Lisbon for you."',
+        description='For `check_weather`: one short sentence spoken while the lookup runs, naming the place. Example: "Let me check Lisbon for you."',
     )
 
 
 INSTRUCTIONS = """
-You answer a live phone call about the weather. You are speaking, not writing:
-short sentences, no lists, no markdown, no emoji, never a number read as a
-digit string.
+You answer a live phone call about the weather. Output is spoken: short
+sentences, no lists, no markdown, no emoji, no digit strings.
 
-Choose `check_weather` when the caller names a place you have not looked up
-yet, and always write a `filler` sentence that names the place. Otherwise
+Choose `check_weather` when the caller names a place that has not been looked
+up yet, and always provide a `filler` sentence naming the place. Otherwise
 choose `speak`.
 
-When a weather result is in the conversation, use it and say the temperature in
-whole degrees Celsius. Only give Fahrenheit if the caller asks for it, and then
-call to_fahrenheit rather than working it out. If `found` is false, say you
-could not find that place and ask for another; if `unreachable` is also true,
-say the weather service is not answering right now and offer to try again.
-Never invent weather.
+When a weather result is in the conversation, use it. Report temperature in
+whole degrees Celsius. Give Fahrenheit only if asked, using to_fahrenheit.
+If `found` is false, say the place could not be found and ask for another.
+If `unreachable` is true, say the weather service is unavailable and offer to
+retry. Never invent weather data.
 """.strip()
 
 
-# --------------------------------------------------------------- think
+# --------------------------------------------------------------------------- think
 
 
 @tool
 def to_fahrenheit(celsius: float) -> int:
-    """Convert a Celsius temperature to whole degrees Fahrenheit."""
+    """Convert Celsius to whole degrees Fahrenheit."""
     return round(celsius * 9 / 5 + 32)
 
 
@@ -86,7 +77,7 @@ _model = None
 
 
 def propose(messages: list) -> Decision:
-    """Ask the model for a Decision. It may use its own tools on the way."""
+    """Run the LangChain agent and return its structured output."""
     global _model
     if _model is None:
         _model = create_agent(
@@ -99,10 +90,10 @@ def propose(messages: list) -> Decision:
 
 
 class State(TypedDict):
-    notes: str                  # the call so far, as plain text
-    known: dict                 # place -> weather result already in the call
+    notes: str                  # flattened transcript
+    known: dict                 # place (lowercase) -> weather result already in the transcript
     proposal: Optional[Decision]
-    problems: list              # why the last proposal was rejected
+    problems: list[str]         # audit failures for the current proposal
     attempts: int
 
 
@@ -113,49 +104,48 @@ def fresh(notes: str, known: dict) -> State:
 def think(state: State) -> dict:
     messages = [("human", state["notes"])]
     if state["problems"]:
-        messages.append(("human", "Your last answer was rejected: " + "; ".join(state["problems"]) + ". Give a corrected answer."))
+        messages.append(("human", "Previous answer rejected: " + "; ".join(state["problems"]) + ". Provide a corrected answer."))
+    attempt = state["attempts"] + 1
     try:
         proposal = propose(messages)
-    except Exception as exc:  # noqa: BLE001 — any model failure is one more attempt, not a crash
-        print(f"[agent] attempt {state['attempts'] + 1}: model failed — {type(exc).__name__}: {str(exc)[:80]}", flush=True)
+    except Exception as exc:  # noqa: BLE001 — counted as a failed attempt
+        print(f"[agent] attempt {attempt}: error {type(exc).__name__}: {str(exc)[:80]}", flush=True)
         proposal = None
     else:
-        what = f"check_weather {proposal.location!r}" if proposal.action == "check_weather" else f"speak {proposal.text[:50]!r}"
-        print(f"[agent] attempt {state['attempts'] + 1}: {what}", flush=True)
-    return {"proposal": proposal, "attempts": state["attempts"] + 1}
+        detail = f"check_weather {proposal.location!r}" if proposal.action == "check_weather" else f"speak {proposal.text[:50]!r}"
+        print(f"[agent] attempt {attempt}: {detail}", flush=True)
+    return {"proposal": proposal, "attempts": attempt}
 
 
-# --------------------------------------------------------------- check
+# --------------------------------------------------------------------------- check
 
 
 def audit(proposal: Optional[Decision], known: dict) -> list[str]:
-    """Everything wrong with a proposal. Empty means it can be spoken.
+    """Validate a proposal. Returns a list of problems; empty means accepted.
 
-    These are the rules the model is told and cannot be trusted to keep. Each
-    one was the model's actual behaviour on a call before it was a rule here.
+    A missing `filler` is defaulted in place rather than rejected.
     """
     if proposal is None:
-        return ["the model gave no usable answer"]
+        return ["no usable answer"]
 
     if proposal.action == "check_weather":
         place = proposal.location.strip().lower()
         if not place:
-            return ["check_weather needs a place"]
+            return ["check_weather requires a location"]
         already = [k for k in known if k in place or place in k]
         if already:
-            return [f"you already have the weather for {already[0]}; answer from it instead of looking it up again"]
+            return [f"weather for {already[0]} is already in the conversation; answer from it"]
         if not proposal.filler.strip():
-            # Fixed rather than rejected: the words are ours to supply.
             proposal.filler = f"Let me check {proposal.location.strip()} for you."
         return []
 
     text = proposal.text.strip()
     if not text:
-        return ["there is nothing to say"]
+        return ["empty text"]
     if any(mark in text for mark in ("**", "##", "\n-", "\n*", "```")):
-        return ["spoken text must not contain markdown"]
+        return ["text contains markdown"]
     if "degree" in text.lower() and not known:
-        return ["you have not looked anything up, so you cannot give a temperature"]
+        return ["temperature given but nothing has been looked up"]
     return []
 
 
@@ -173,11 +163,8 @@ def route(state: State) -> str:
 
 
 def fallback(state: State) -> dict:
-    print("[agent] falling back to a safe sentence", flush=True)
+    print("[agent] fallback", flush=True)
     return {"proposal": Decision(action="speak", text=FALLBACK), "problems": []}
-
-
-# --------------------------------------------------------------- the graph
 
 
 _graph = StateGraph(State)
@@ -191,17 +178,15 @@ _graph.add_edge("fallback", END)
 graph = _graph.compile()
 
 
-# --------------------------------------------------------------- the seam
+# --------------------------------------------------------------------------- reply endpoint
 
 
 def transcript(turn: Turn) -> tuple[str, dict]:
-    """The call so far as plain notes, and every weather result it contains.
+    """Flatten the platform transcript to text and collect prior weather results.
 
-    Flattened rather than passed through as chat messages: the platform's
-    transcript carries its own tool calls, which this agent was never given
-    and would reject. Every lookup result stays in — two turns later the
-    caller asks "and in Fahrenheit?", and the model needs the Celsius figure,
-    not its own rounded sentence about it.
+    Platform tool calls are not forwarded as chat messages: the LangChain agent
+    was not given those tools and would reject them. Tool results are kept in
+    the text so later turns can reference them (e.g. unit conversion).
     """
     lines, known = [], {}
 
@@ -234,21 +219,18 @@ _pool = ThreadPoolExecutor(max_workers=4)
 
 
 def reply(turn: Turn):
-    """One turn: run the graph within the budget, and translate the answer.
+    """Reply callback for `serve()`.
 
-    Synchronous on purpose. `serve()` awaits a coroutine from a tool or a
-    pre-connect handler but not from here, so an `async def reply` is never
-    awaited and the turn goes out empty.
+    Must be synchronous: `serve()` does not await the reply callable.
     """
     notes, known = transcript(turn)
     try:
         decision = _pool.submit(graph.invoke, fresh(notes, known)).result(timeout=REPLY_BUDGET_SECONDS)["proposal"]
     except ReplyTimeout:
-        print(f"[agent] no answer in {REPLY_BUDGET_SECONDS:.0f}s — falling back", flush=True)
+        print(f"[agent] timeout after {REPLY_BUDGET_SECONDS:.0f}s; fallback", flush=True)
         decision = Decision(action="speak", text=FALLBACK)
 
     if decision.action == "check_weather":
-        # `saying=` puts the words in the same response as the tool call, so
-        # they are spoken while the lookup runs instead of after it.
+        # `saying` is spoken while the platform runs the tool.
         return call_tool("get_weather", saying=decision.filler, location=decision.location)
     return say(decision.text)
