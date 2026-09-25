@@ -1,41 +1,33 @@
 # Give your text agent a voice
 
-You already have a text agent — a prompt, some tools, a framework you like.
-This puts a phone call in front of it, and shows the same call answered by four
-different frameworks so you can see how little of it is framework-specific.
-
-| Brain | File | Lines |
-| --- | --- | --- |
-| [PydanticAI](https://ai.pydantic.dev) | `brains/pydantic_ai.py` | ~40 |
-| [LangChain](https://python.langchain.com) | `brains/langchain.py` | ~25 |
-| [Agno](https://docs.agno.com) | `brains/agno.py` | ~30 |
-| [Google ADK](https://google.github.io/adk-docs) | `brains/google_adk.py` | ~50 |
-
-```bash
-BRAIN=agno .venv/bin/python run.py
-```
+You have a text agent — a model, a prompt, some tools, in a framework you like.
+This puts a phone call in front of it.
 
 AssemblyAI handles the ear and the mouth: speech to text, turn-taking,
 barge-in, text to speech, the phone line. It does not decide what to say. Your
 agent does, over one HTTP endpoint you already know how to write.
 
 ```
-caller ──phone/browser──▶  AssemblyAI  ──POST /v1/chat/completions──▶  brains/<yours>.py
-                          speech, turns                                 your text agent
+caller ──phone/browser──▶  AssemblyAI  ──POST /v1/chat/completions──▶  agent.py
+                          speech, turns                                 your LangChain agent
                           TTS, telephony  ◀── say this / call that ──
 ```
 
-The example is a weather line. Ask it for a city, it looks the weather up, and
-it talks to you while the lookup runs:
+The example is a weather line, and the agent is LangChain. Ask it for a city,
+it looks the weather up, and it talks to you while the lookup runs:
 
 ```
-  [  3.0s] agent:  Weather line, which place would you like?
-  [  3.3s] caller: what is the weather in Reykjavik
-  [ 10.4s] agent:  Let me check Reykjavik for you.
-  [ 16.4s] agent:  In Reykjavik, Iceland, it's seven degrees and overcast with light winds.
+  [  2.8s] agent:  Weather line, which place would you like?
+  [ 13.1s] caller: what is the weather in Lisbon
+  [ 21.0s] agent:  Let me check Lisbon for you.
+  [ 26.4s] agent:  In Lisbon it's overcast and twenty-one degrees Celsius with a light wind.
+  [ 36.4s] caller: and what is that in fahrenheit
+  [ 45.4s] agent:  That's seventy degrees Fahrenheit.
 ```
 
-That third line is the point. See [Talking over a tool](#talking-over-a-tool).
+The third line is spoken while the lookup runs. The last one never leaves the
+agent: it is a LangChain tool, called in-process, and the platform is not
+involved.
 
 ## Run it
 
@@ -44,10 +36,9 @@ and [ngrok](https://ngrok.com/download) — the platform calls your laptop, so i
 needs a public address.
 
 ```bash
-./setup.sh                        # venv + dependencies
+./setup.sh                 # venv + dependencies
 # put your key in .env
-.venv/bin/python run.py           # tunnel, deploy, serve — PydanticAI brain
-BRAIN=langchain .venv/bin/python run.py   # or agno, google_adk
+.venv/bin/python run.py    # tunnel, deploy, serve
 ```
 
 Then open the [playground](https://www.assemblyai.com/playground/voice-agent)
@@ -60,61 +51,59 @@ and pick the agent it printed, or call it from a second terminal:
 `call.py` speaks in the macOS `say` voice, streams it in as a caller would, and
 writes the agent's side to `call.wav`. No phone, no browser.
 
-One API key covers everything. The text model is reached through AssemblyAI's
-LLM gateway with the same key, whichever brain is running.
+One API key covers everything: the text model is reached through AssemblyAI's
+LLM gateway with the same key.
 
-## The seam
+## Two files matter
 
-Every brain is one function:
+**`agent.py` is your agent.** It is an ordinary LangChain agent — `create_agent`
+with a model, a system prompt, its own tools and a structured answer — plus one
+function that is the whole contract with the voice:
 
 ```python
 def reply(turn: Turn) -> Say | Call:
     ...
 ```
 
-`turn` carries the conversation so far and the result of any tool that just
-ran. You return `say("...")` to speak, or `call_tool("name", ...)` to run one of
-the agent's tools and answer on the next turn.
+`turn` carries the conversation so far and the result of any platform tool that
+just ran. You return `say("...")` to speak, or `call_tool("name", ...)` to run
+one of the platform's tools and answer on the next turn. Swap LangChain for
+anything else and that function is still the seam.
 
-The four brains all do it the same way: hand the model the transcript, get a
-`Decision` back as structured output, translate it. What differs is only how
-each framework asks for structured output — `output_type`,
-`with_structured_output`, `output_schema`, `output_schema` — and whether it is
-sync or async. `bridge.py` holds the parts that are the same: the `Decision`
-model, the instructions, the transcript flattening, and an event-loop bridge
-for the async ones.
+**`voice.py` is the platform's side.** The voice, the greeting, and the tools
+the platform runs itself.
 
-To plug in your own agent, add `brains/mine.py` with a `reply`, and add its name
-to `AVAILABLE` in `brains/__init__.py`. Then `BRAIN=mine`.
+## Which tools go where
 
-## Talking over a tool
+This is the design decision the example exists to show.
 
-A tool that takes a few seconds is a few seconds of silence, which a caller
-reads as a dropped line. One response can carry both a tool call and words, so
-the agent says something while the tool runs:
+**Fast tools live in your agent.** `to_fahrenheit` is a LangChain tool. The
+agent calls it mid-turn, in-process, in a millisecond, and the caller hears only
+the answer. That is what a framework buys you over a bare model call: the
+agent can take several steps and use several tools before it decides what to
+say, and none of it touches the voice.
+
+**Slow tools live on the platform.** The weather lookup is two network calls —
+a couple of seconds of silence on a phone line, which a caller reads as a
+dropped call. Declared in `voice.py`, it runs on the platform, and that lets the
+agent hand back words in the same response as the call:
 
 ```python
 return call_tool("get_weather", saying="Let me check Lisbon for you.", location="Lisbon")
 ```
 
 The filler is written by the model, in context, naming the place — not a canned
-"one moment". That is the reason to pair a text model with a voice one rather
-than let the voice model do everything.
+"one moment". For work measured in tens of seconds, have the tool answer in
+stages and ask it again; each answer is its own turn, so each gets its own line.
 
-For work measured in tens of seconds, have the tool answer in stages and ask it
-again; each answer is its own turn, so each gets its own spoken line.
-
-## The files
+## The other files
 
 | | |
 | --- | --- |
-| `brains/` | One file per framework. The only thing you replace. |
-| `bridge.py` | What every brain shares. |
-| `agent.py` | The voice configuration, and the weather tool. |
 | `run.py` | Tunnel, deploy, serve. |
 | `call.py` | Call it from the terminal. |
 | `phone.py` | Put it on a real number: `list`, `buy GB`, `attach +44…`. |
-| `tests/` | Every brain through the same two turns. `pytest -q`. |
+| `tests/` | The turns a call actually has. `pytest -q`. |
 
 ## Configuration
 
@@ -123,7 +112,6 @@ All optional, in `.env`:
 | | |
 | --- | --- |
 | `ASSEMBLYAI_API_KEY` | Required. |
-| `BRAIN` | `pydantic_ai` (default), `langchain`, `agno`, `google_adk`. |
 | `MODEL` | Default `claude-haiku-4-5-20251001`. |
 | `LLM_GATEWAY` | Default AssemblyAI's gateway. Any OpenAI-compatible base URL works. |
 | `VOICE` | Default `alba`. |
@@ -133,13 +121,10 @@ All optional, in `.env`:
 
 - **`reply` must be synchronous.** `serve()` awaits a coroutine from a tool or
   a pre-connect handler but not from the reply endpoint; an `async def reply`
-  is silently never awaited and the turn goes out empty. The async brains go
-  through `bridge.run_sync`, which is also why there is exactly one event loop:
-  a fresh loop per turn leaves the framework's HTTP client bound to the old one.
-- **The gateway is not quite OpenAI-shaped.** It omits `id` and `object` and
-  passes the upstream `finish_reason` through. Three of the four frameworks
-  read only what they need and never notice; PydanticAI validates the whole
-  response, so it gets a client from `bridge.py` that fills the fields in.
+  is silently never awaited and the turn goes out empty.
+- **Flatten the transcript.** The platform's message list carries its own tool
+  calls, which your agent was never given and will reject. `agent.py` turns it
+  into plain notes.
 - **A tool that raises is silence.** The platform gets a 500 and the caller
   hears nothing, so the weather tool returns its failures instead.
 - **`event.type` on the realtime models is an Enum**, not a string. `call.py`

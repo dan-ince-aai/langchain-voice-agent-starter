@@ -1,16 +1,12 @@
 # The Voice Agents backend SDK.
 assemblyai-agents @ git+https://github.com/dan-ince-aai/assemblyai-agents-python.git@main
 
-# Used by the weather tool.
-httpx>=0.28
-
-# One brain per framework. Keep the ones you want; `BRAIN=` picks at run time.
-pydantic-ai>=2.0
+# The text agent.
 langchain>=1.0
 langchain-openai>=1.0
-agno>=3.0
-google-adk>=2.0
-litellm
+
+# Used by the weather tool.
+httpx>=0.28
 
 # Only for the tests.
 pytest>=8

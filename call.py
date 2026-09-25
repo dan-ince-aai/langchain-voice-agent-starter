@@ -1,11 +1,11 @@
 """Call the agent from here, with no phone and no browser.
 
-    python call.py "what is the weather in Lisbon"
+    python call.py "what is the weather in Lisbon" "and in fahrenheit?"
 
-Speaks the sentence in the macOS `say` voice, streams it to the agent the way a
-caller would, and writes what the agent said back to `call.wav`. The transcript
-prints as it arrives, so you can watch the filler land while the tool is still
-running.
+Each argument is one thing the caller says, spoken in the macOS `say` voice and
+streamed in the way a caller would, one after the agent has answered the last.
+The transcript prints as it arrives, so you can watch the filler land while the
+tool is still running, and the agent's side is written to `call.wav`.
 
 Needs the agent running: start `run.py` in another terminal first.
 """
@@ -53,27 +53,40 @@ async def say_to(session, pcm: bytes) -> None:
 
 async def main() -> int:
     load_env()
-    sentence = " ".join(sys.argv[1:]) or "what is the weather in Lisbon"
+    turns = sys.argv[1:] or ["what is the weather in Lisbon"]
     if not ID_FILE.exists():
         sys.exit("No .agent_id yet — run `python run.py` first.")
+    agent_id = ID_FILE.read_text().strip()
 
-    caller = speak(sentence)
-    track, started, spoken = bytearray(), time.perf_counter(), False
+    track, started = bytearray(), time.perf_counter()
+    answered = False  # has the agent finished a reply since the caller last spoke?
 
     def at() -> float:
         return time.perf_counter() - started
 
     session = await AsyncClient().sessions.connect()
-    await session.update(agent_id=ID_FILE.read_text().strip())
-    print(f"calling {ID_FILE.read_text().strip()}\n")
+    await session.update(agent_id=agent_id)
+    print(f"calling {agent_id}\n")
 
-    # Stop on quiet rather than on a count of replies: a transcript can arrive
-    # after the `reply.done` it belongs to, so counting clips the last line.
+    # The caller speaks into quiet, not on a count of replies. The client cannot
+    # see the platform running a tool: after "let me check Lisbon for you" the
+    # line goes silent for as long as the lookup and the next reply take, and
+    # speaking into that gap talks over the answer. A person waits through it,
+    # so this waits ten seconds of nothing before taking a turn, and eight with
+    # nothing left to say before hanging up.
     events = session.__aiter__()
-    while at() < 90:
+    while at() < 150:
         try:
-            event = await asyncio.wait_for(events.__anext__(), timeout=8)
-        except (asyncio.TimeoutError, StopAsyncIteration):
+            event = await asyncio.wait_for(events.__anext__(), timeout=10 if turns else 8)
+        except asyncio.TimeoutError:
+            if turns and answered:
+                sentence = turns.pop(0)
+                answered = False
+                print(f"  [{at():5.1f}s] caller: {sentence}")
+                await say_to(session, speak(sentence))
+                continue
+            break
+        except StopAsyncIteration:
             break
 
         # `type` is an Enum on these models, not a str, so read its value.
@@ -86,10 +99,8 @@ async def main() -> int:
             print(f"  [{at():5.1f}s] agent:  {event.text}")
         elif kind == "session.error":
             print(f"  [{at():5.1f}s] error:  {event.message}")
-        elif kind == "reply.done" and not spoken:
-            spoken = True
-            print(f"  [{at():5.1f}s] caller: {sentence}")
-            await say_to(session, caller)
+        elif kind == "reply.done":
+            answered = True
 
     await session.end()
     await session.close()
