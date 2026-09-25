@@ -1,6 +1,7 @@
 """Start everything: a public address, the agent, and this process serving it.
 
-    python run.py
+    python run.py                  # PydanticAI brain
+    BRAIN=langchain python run.py  # or agno, google_adk
 
 The platform reaches your laptop over HTTPS -- a phone call has no client on
 the other end for it to ask -- so this opens an ngrok tunnel, points a stored
@@ -106,17 +107,22 @@ def main() -> int:
     from assemblyai_agents.serving import serve
 
     import agent
-    import brain
+    import bridge
+    import brains
+
+    brain = os.environ.get("BRAIN", "pydantic_ai")
+    reply = brains.load(brain)
 
     with tunnel(PORT) as base_url:
         agent_id = deploy(base_url)
         secret = os.environ["TOOL_SECRET"]
-        print(f"model   {brain.MODEL} via {brain.GATEWAY}")
+        print(f"brain   {brain}  (others: {', '.join(b for b in brains.AVAILABLE if b != brain)})")
+        print(f"model   {bridge.MODEL} via {bridge.GATEWAY}")
         print(f"\nTalk to it:  https://www.assemblyai.com/playground/voice-agent  (agent {agent_id})")
         print("Or attach a phone number to that agent and call it.\n")
         serve(
             agent.build(base_url),
-            reply=brain.reply,
+            reply=reply,
             port=PORT,
             tool_secret=secret,
             llm_key=secret,
