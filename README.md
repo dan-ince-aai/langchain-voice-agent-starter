@@ -24,20 +24,35 @@ same way.
 .venv/bin/python call.py                     # talk to it — mic in, speaker out
 ```
 
-One key does everything. Add a real phone number with `python phone.py buy GB`.
+One key does everything. Wear headphones, or the mic hears the agent and it
+answers itself. Add a real phone number with `python phone.py buy GB`.
 
 ## How it works
 
 Two files.
 
-**`agent.py` is your agent.** A normal LangChain agent with one extra function:
+**`agent.py` is your agent.** A LangGraph graph with three steps:
+
+```
+think  →  check  →  answer
+   ↑         │
+   └─ rejected, with the reason (twice, then a safe sentence)
+```
+
+The model proposes what to say; the graph holds it to rules the model can't
+be trusted with — no temperature it never looked up, no second lookup of a
+place it already has, nothing unspeakable. A bad proposal goes back with the
+reason. A model that fails or hangs becomes a safe sentence, never silence.
+That loop is the difference between an agent and a gateway.
+
+The platform talks to it through one function:
 
 ```python
 def reply(turn) -> Say | Call
 ```
 
-The platform sends what the caller said; you send back words to speak, or a
-tool to run. That's the whole integration.
+It sends what the caller said; you send back words to speak, or a tool to
+run. That's the whole integration.
 
 **`voice.py` is the phone.** The voice, the greeting, and the weather lookup.
 
