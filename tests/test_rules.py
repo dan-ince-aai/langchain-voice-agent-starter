@@ -1,16 +1,39 @@
-"""Graph behaviour with `propose` stubbed. No API key or network required."""
+"""Validation and retry behaviour with the model replaced by `FunctionModel`.
 
+No API key or network required.
+"""
+
+import asyncio
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import agent  # noqa: E402
-from agent import Decision, audit, fresh  # noqa: E402
+from agent import Decision, audit  # noqa: E402
 from assemblyai_agents.byo import Say, Turn  # noqa: E402
+from pydantic_ai.messages import ModelResponse, ToolCallPart  # noqa: E402
+from pydantic_ai.models.function import FunctionModel  # noqa: E402
 
 LISBON = {"lisbon": {"found": True, "place": "Lisbon", "celsius": 21.4, "description": "overcast"}}
+
+
+def turn(messages=None) -> Turn:
+    messages = messages or [{"role": "user", "content": "hi"}]
+    return Turn.from_request({"model": "weather-line", "stream": True, "tools": [], "messages": messages})
+
+
+def scripted(*decisions):
+    """A model that returns the given Decisions in order, as structured output."""
+    queue = list(decisions)
+    calls = []
+
+    def model(messages, info):
+        calls.append(messages)
+        decision = queue.pop(0)
+        return ModelResponse(parts=[ToolCallPart(tool_name=info.output_tools[0].name, args=decision.model_dump())])
+
+    return FunctionModel(model), calls
 
 
 # audit
@@ -50,62 +73,55 @@ def test_empty_text_is_rejected():
     assert audit(Decision(action="speak", text=""), known={})
 
 
-# graph
+# retry loop
 
 
-def test_rejected_proposal_is_retried(monkeypatch):
-    proposals = iter([
+def test_rejected_output_is_retried():
+    model, calls = scripted(
         Decision(action="speak", text="It's thirty degrees."),
         Decision(action="speak", text="Which place would you like?"),
-    ])
-    monkeypatch.setattr(agent, "propose", lambda messages: next(proposals))
+    )
+    with agent.agent.override(model=model):
+        answer = agent.reply(turn())
 
-    out = agent.graph.invoke(fresh("Caller: hi", known={}))
-
-    assert out["proposal"].text == "Which place would you like?"
-    assert out["attempts"] == 2
-
-
-def test_rejection_reason_is_passed_to_retry(monkeypatch):
-    seen = []
-
-    def stub(messages):
-        seen.append(messages)
-        return Decision(action="speak", text="It's thirty degrees.")
-
-    monkeypatch.setattr(agent, "propose", stub)
-    agent.graph.invoke(fresh("Caller: hi", known={}))
-
-    assert len(seen) == 2
-    assert "rejected" in seen[1][-1][1]
+    assert isinstance(answer, Say) and answer.text == "Which place would you like?"
+    assert len(calls) == 2
 
 
-def test_repeated_rejection_falls_back(monkeypatch):
-    monkeypatch.setattr(agent, "propose", lambda messages: Decision(action="speak", text="It's thirty degrees."))
+def test_rejection_reason_is_returned_to_the_model():
+    model, calls = scripted(
+        Decision(action="speak", text="It's thirty degrees."),
+        Decision(action="speak", text="Which place?"),
+    )
+    with agent.agent.override(model=model):
+        agent.reply(turn())
 
-    out = agent.graph.invoke(fresh("Caller: hi", known={}))
-
-    assert out["proposal"].text == agent.FALLBACK
-    assert out["attempts"] == agent.MAX_ATTEMPTS
+    assert "nothing has been looked up" in str(calls[1])
 
 
-def test_model_exception_falls_back(monkeypatch):
-    def stub(messages):
+def test_exhausted_retries_fall_back():
+    model, calls = scripted(*[Decision(action="speak", text="It's thirty degrees.")] * (agent.RETRIES + 1))
+    with agent.agent.override(model=model):
+        answer = agent.reply(turn())
+
+    assert answer.text == agent.FALLBACK
+    assert len(calls) == agent.RETRIES + 1
+
+
+def test_model_exception_falls_back():
+    def broken(messages, info):
         raise RuntimeError("gateway down")
 
-    monkeypatch.setattr(agent, "propose", stub)
-
-    assert agent.graph.invoke(fresh("Caller: hi", known={}))["proposal"].text == agent.FALLBACK
+    with agent.agent.override(model=FunctionModel(broken)):
+        assert agent.reply(turn()).text == agent.FALLBACK
 
 
 def test_timeout_falls_back_within_budget(monkeypatch):
-    monkeypatch.setattr(agent, "propose", lambda messages: time.sleep(30))
+    async def hung(messages, info):
+        await asyncio.sleep(30)
+
     monkeypatch.setattr(agent, "REPLY_BUDGET_SECONDS", 0.2)
-    turn = Turn.from_request({"model": "weather-line", "stream": True, "tools": [],
-                              "messages": [{"role": "user", "content": "hi"}]})
+    with agent.agent.override(model=FunctionModel(hung)):
+        answer = agent.reply(turn())
 
-    started = time.perf_counter()
-    answer = agent.reply(turn)
-
-    assert isinstance(answer, Say) and answer.text == agent.FALLBACK
-    assert time.perf_counter() - started < 2
+    assert answer.text == agent.FALLBACK

@@ -1,8 +1,8 @@
-# langchain-voice-agent-starter
+# pydantic-ai-voice-agent-starter
 
-A LangChain/LangGraph agent answering a phone call through the AssemblyAI
-Voice Agents API. The platform handles speech-to-text, turn detection,
-barge-in, text-to-speech and telephony; the agent decides what to say.
+A PydanticAI agent answering a phone call through the AssemblyAI Voice Agents
+API. The platform handles speech-to-text, turn detection, barge-in,
+text-to-speech and telephony; the agent decides what to say.
 
 ```
   agent:  Weather line, which place would you like?
@@ -10,7 +10,7 @@ barge-in, text-to-speech and telephony; the agent decides what to say.
   agent:  Let me check Lisbon for you.            # spoken while the platform tool runs
   agent:  In Lisbon it's overcast and twenty-one degrees Celsius.
   caller: and what is that in fahrenheit
-  agent:  That's seventy degrees Fahrenheit.      # local LangChain tool, no platform round trip
+  agent:  That's seventy degrees Fahrenheit.      # agent tool, no platform round trip
 ```
 
 ## Requirements
@@ -37,7 +37,7 @@ headphones with `call.py`.
 
 | File | Purpose |
 | --- | --- |
-| `agent.py` | LangGraph agent and the reply endpoint callback. |
+| `agent.py` | PydanticAI agent and the reply endpoint callback. |
 | `voice.py` | Platform configuration: voice, greeting, platform tools. |
 | `run.py` | Tunnel, create/update the agent, serve. |
 | `call.py` | Microphone client. |
@@ -50,24 +50,19 @@ The platform calls `POST /v1/chat/completions` on this process for every turn.
 `agent.reply(turn)` returns either `say(text)` or `call_tool(name, ...)`. This is
 the whole integration surface; the agent behind it can be anything.
 
-`agent.py` implements it as a LangGraph graph:
+`agent.py` is a PydanticAI `Agent` with `output_type=Decision`, one tool
+(`to_fahrenheit`), and an output validator:
 
-```
-think -> check -> END
-           |-> think     rejected; reason appended; up to MAX_ATTEMPTS
-           |-> fallback  after MAX_ATTEMPTS, on model error, or on timeout
-```
-
-- `think` runs a LangChain agent (`create_agent`) with structured output
-  (`Decision`) and local tools (`to_fahrenheit`).
-- `check` validates the proposal with `audit()`: no temperature without a
-  lookup in the transcript, no repeat lookup of a known place, no empty or
-  markdown text. A missing filler sentence is defaulted.
-- `reply` enforces `REPLY_BUDGET_SECONDS` and returns `FALLBACK` on timeout.
+- The model produces a `Decision`: speak some text, or look a place up.
+- `check()` validates it with `audit()`: no temperature without a lookup in the
+  transcript, no repeat lookup of a known place, no empty or markdown text. A
+  failure raises `ModelRetry`, and the model gets the reason back (`retries=1`).
+- `reply()` runs the agent within `REPLY_BUDGET_SECONDS` and returns `FALLBACK`
+  on timeout, model error, or exhausted retries.
 
 ### Tool placement
 
-`get_weather` is a platform tool (`voice.py`), not a LangChain tool, because a
+`get_weather` is a platform tool (`voice.py`), not an agent tool, because a
 platform tool call can carry speech in the same response:
 
 ```python
@@ -76,13 +71,20 @@ return call_tool("get_weather", saying="Let me check Lisbon for you.", location=
 
 The platform speaks `saying` while it runs the tool, then calls the reply
 endpoint again with the result. Tools that complete quickly (`to_fahrenheit`)
-run inside the LangChain agent and never involve the platform.
+run inside the agent and never involve the platform.
 
 ### Transcript handling
 
 The platform sends the full conversation each turn, including its own tool
 calls. `transcript()` flattens it to text and retains tool results, so later
 turns can reference earlier lookups without re-running them.
+
+### Gateway response shape
+
+The AssemblyAI LLM gateway omits `id` and `object` and passes the upstream
+`finish_reason` through. PydanticAI validates the full response, so `agent.py`
+installs an `httpx2` transport that fills those fields in. It is inert against
+an endpoint that already returns them.
 
 ## Configuration
 

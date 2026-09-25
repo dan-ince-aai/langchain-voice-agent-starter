@@ -1,40 +1,35 @@
-"""LangGraph agent behind the reply endpoint.
+"""PydanticAI agent behind the reply endpoint.
 
 The platform POSTs an OpenAI-format chat completion request for each turn.
 `reply()` returns either speech (`say`) or a platform tool call (`call_tool`).
 
-Graph:
-
-    think -> check -> END
-               |-> think     (rejected; reason appended; up to MAX_ATTEMPTS)
-               |-> fallback  (rejected MAX_ATTEMPTS times)
-
-`think` runs a LangChain agent with local tools and structured output.
-`check` validates the proposal with `audit()`. Model exceptions count as a
-failed attempt. `reply()` enforces a wall-clock budget; on timeout it returns
-the fallback response.
+The agent's output is a `Decision`. An output validator checks each one with
+`audit()`; a failure raises `ModelRetry`, which returns the reason to the model
+for another attempt (`retries=1`). Exhausted retries, a model error, or
+exceeding `REPLY_BUDGET_SECONDS` produce the `FALLBACK` response.
 """
 
+import asyncio
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
+import threading
 from concurrent.futures import TimeoutError as ReplyTimeout
-from typing import Literal, Optional, TypedDict
+from dataclasses import dataclass
+from typing import Literal
 
+import httpx2
 from assemblyai_agents.byo import Turn, call_tool, say
-from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
-from langchain.tools import tool
-from langchain_openai import ChatOpenAI
-from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
+from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
 
 GATEWAY = os.environ.get("LLM_GATEWAY", "https://llm-gateway.assemblyai.com/v1")
 MODEL = os.environ.get("MODEL", "claude-haiku-4-5-20251001")
 
 # The platform allows roughly 10s for a reply.
 REPLY_BUDGET_SECONDS = 8.0
-MAX_ATTEMPTS = 2
+RETRIES = 1
 FALLBACK = "Sorry, I missed that. Which place would you like the weather for?"
 
 
@@ -64,70 +59,70 @@ retry. Never invent weather data.
 """.strip()
 
 
-# --------------------------------------------------------------------------- think
+# --------------------------------------------------------------------------- gateway client
+
+# The AssemblyAI LLM gateway omits `id` and `object` from responses and passes
+# the upstream provider's `finish_reason` through unchanged. PydanticAI
+# validates the full response, so these are filled in here. Harmless against
+# an endpoint that already returns them.
+_FINISH = {"end_turn": "stop", "stop_sequence": "stop", "max_tokens": "length", "tool_use": "tool_calls"}
 
 
-@tool
+class _OpenAIShaped(httpx2.AsyncHTTPTransport):
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        response = await super().handle_async_request(request)
+        await response.aread()
+        try:
+            body = json.loads(response.content)
+        except ValueError:
+            return response
+        if not isinstance(body, dict) or "choices" not in body:
+            return response
+        body["id"] = body.get("id") or body.get("request_id") or "chatcmpl-gateway"
+        body["object"] = body.get("object") or "chat.completion"
+        for choice in body.get("choices") or []:
+            reason = choice.get("finish_reason")
+            choice["finish_reason"] = _FINISH.get(reason, reason or "stop")
+        headers = {k: v for k, v in response.headers.items() if k.lower() not in ("content-length", "content-encoding")}
+        return httpx2.Response(response.status_code, headers=headers, content=json.dumps(body).encode(), request=request)
+
+
+# --------------------------------------------------------------------------- agent
+
+
+@dataclass
+class Deps:
+    known: dict  # place (lowercase) -> weather result already in the transcript
+
+
+agent = Agent(
+    OpenAIChatModel(
+        MODEL,
+        provider=OpenAIProvider(
+            base_url=GATEWAY,
+            # Read at import; run.py loads .env first. Placeholder keeps imports key-free.
+            api_key=os.environ.get("ASSEMBLYAI_API_KEY") or "unset",
+            http_client=httpx2.AsyncClient(transport=_OpenAIShaped(), timeout=60),
+        ),
+    ),
+    output_type=Decision,
+    instructions=INSTRUCTIONS,
+    deps_type=Deps,
+    retries=RETRIES,
+)
+
+
+@agent.tool_plain
 def to_fahrenheit(celsius: float) -> int:
     """Convert Celsius to whole degrees Fahrenheit."""
     return round(celsius * 9 / 5 + 32)
 
 
-_model = None
-
-
-def propose(messages: list) -> Decision:
-    """Run the LangChain agent and return its structured output."""
-    global _model
-    if _model is None:
-        _model = create_agent(
-            ChatOpenAI(model=MODEL, base_url=GATEWAY, api_key=os.environ["ASSEMBLYAI_API_KEY"]),
-            tools=[to_fahrenheit],
-            system_prompt=INSTRUCTIONS,
-            response_format=ToolStrategy(Decision),
-        )
-    return _model.invoke({"messages": messages})["structured_response"]
-
-
-class State(TypedDict):
-    notes: str                  # flattened transcript
-    known: dict                 # place (lowercase) -> weather result already in the transcript
-    proposal: Optional[Decision]
-    problems: list[str]         # audit failures for the current proposal
-    attempts: int
-
-
-def fresh(notes: str, known: dict) -> State:
-    return {"notes": notes, "known": known, "proposal": None, "problems": [], "attempts": 0}
-
-
-def think(state: State) -> dict:
-    messages = [("human", state["notes"])]
-    if state["problems"]:
-        messages.append(("human", "Previous answer rejected: " + "; ".join(state["problems"]) + ". Provide a corrected answer."))
-    attempt = state["attempts"] + 1
-    try:
-        proposal = propose(messages)
-    except Exception as exc:  # noqa: BLE001 — counted as a failed attempt
-        print(f"[agent] attempt {attempt}: error {type(exc).__name__}: {str(exc)[:80]}", flush=True)
-        proposal = None
-    else:
-        detail = f"check_weather {proposal.location!r}" if proposal.action == "check_weather" else f"speak {proposal.text[:50]!r}"
-        print(f"[agent] attempt {attempt}: {detail}", flush=True)
-    return {"proposal": proposal, "attempts": attempt}
-
-
-# --------------------------------------------------------------------------- check
-
-
-def audit(proposal: Optional[Decision], known: dict) -> list[str]:
+def audit(proposal: Decision, known: dict) -> list[str]:
     """Validate a proposal. Returns a list of problems; empty means accepted.
 
     A missing `filler` is defaulted in place rather than rejected.
     """
-    if proposal is None:
-        return ["no usable answer"]
-
     if proposal.action == "check_weather":
         place = proposal.location.strip().lower()
         if not place:
@@ -149,33 +144,15 @@ def audit(proposal: Optional[Decision], known: dict) -> list[str]:
     return []
 
 
-def check(state: State) -> dict:
-    problems = audit(state["proposal"], state["known"])
+@agent.output_validator
+def check(ctx: RunContext[Deps], proposal: Decision) -> Decision:
+    problems = audit(proposal, ctx.deps.known)
     if problems:
         print(f"[agent] rejected: {problems[0]}", flush=True)
-    return {"problems": problems}
-
-
-def route(state: State) -> str:
-    if not state["problems"]:
-        return END
-    return "think" if state["attempts"] < MAX_ATTEMPTS else "fallback"
-
-
-def fallback(state: State) -> dict:
-    print("[agent] fallback", flush=True)
-    return {"proposal": Decision(action="speak", text=FALLBACK), "problems": []}
-
-
-_graph = StateGraph(State)
-_graph.add_node("think", think)
-_graph.add_node("check", check)
-_graph.add_node("fallback", fallback)
-_graph.add_edge(START, "think")
-_graph.add_edge("think", "check")
-_graph.add_conditional_edges("check", route, {"think": "think", "fallback": "fallback", END: END})
-_graph.add_edge("fallback", END)
-graph = _graph.compile()
+        raise ModelRetry("; ".join(problems))
+    detail = f"check_weather {proposal.location!r}" if proposal.action == "check_weather" else f"speak {proposal.text[:50]!r}"
+    print(f"[agent] {detail}", flush=True)
+    return proposal
 
 
 # --------------------------------------------------------------------------- reply endpoint
@@ -184,9 +161,9 @@ graph = _graph.compile()
 def transcript(turn: Turn) -> tuple[str, dict]:
     """Flatten the platform transcript to text and collect prior weather results.
 
-    Platform tool calls are not forwarded as chat messages: the LangChain agent
-    was not given those tools and would reject them. Tool results are kept in
-    the text so later turns can reference them (e.g. unit conversion).
+    Platform tool calls are not forwarded as chat messages: the agent was not
+    given those tools. Tool results are kept in the text so later turns can
+    reference them (e.g. unit conversion).
     """
     lines, known = [], {}
 
@@ -215,19 +192,25 @@ def transcript(turn: Turn) -> tuple[str, dict]:
     return "\n".join(lines) or "The caller has just connected.", known
 
 
-_pool = ThreadPoolExecutor(max_workers=4)
+# One event loop for the process. `serve()` calls `reply` synchronously from
+# request threads; a loop per call would leave the HTTP client bound to a
+# closed loop on the next turn.
+_loop = asyncio.new_event_loop()
+threading.Thread(target=_loop.run_forever, daemon=True).start()
 
 
 def reply(turn: Turn):
-    """Reply callback for `serve()`.
-
-    Must be synchronous: `serve()` does not await the reply callable.
-    """
+    """Reply callback for `serve()`. Must be synchronous."""
     notes, known = transcript(turn)
+    future = asyncio.run_coroutine_threadsafe(agent.run(notes, deps=Deps(known)), _loop)
     try:
-        decision = _pool.submit(graph.invoke, fresh(notes, known)).result(timeout=REPLY_BUDGET_SECONDS)["proposal"]
+        decision = future.result(timeout=REPLY_BUDGET_SECONDS).output
     except ReplyTimeout:
+        future.cancel()
         print(f"[agent] timeout after {REPLY_BUDGET_SECONDS:.0f}s; fallback", flush=True)
+        decision = Decision(action="speak", text=FALLBACK)
+    except Exception as exc:  # noqa: BLE001 — retries exhausted or model error
+        print(f"[agent] {type(exc).__name__}: {str(exc)[:80]}; fallback", flush=True)
         decision = Decision(action="speak", text=FALLBACK)
 
     if decision.action == "check_weather":

@@ -3,8 +3,7 @@
 assemblyai-agents[audio] @ git+https://github.com/dan-ince-aai/assemblyai-agents-python.git@main
 
 # The text agent.
-langchain>=1.0
-langchain-openai>=1.0
+pydantic-ai>=2.0
 
 # Used by the weather tool.
 httpx>=0.28

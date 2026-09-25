@@ -49,7 +49,7 @@ def test_lookup_result_produces_spoken_answer():
     assert "overcast" in answer.text.lower() or "twenty" in answer.text.lower(), answer.text
 
 
-def test_fahrenheit_is_answered_with_local_tool():
+def test_fahrenheit_is_answered_with_agent_tool():
     answer = agent.reply(turn(LOOKED_UP + [
         {"role": "assistant", "content": "It's overcast in Lisbon, twenty one degrees."},
         {"role": "user", "content": "what's that in fahrenheit?"},
@@ -60,5 +60,5 @@ def test_fahrenheit_is_answered_with_local_tool():
 
 
 def test_to_fahrenheit():
-    assert agent.to_fahrenheit.invoke({"celsius": 21.4}) == 71
-    assert agent.to_fahrenheit.invoke({"celsius": -40}) == -40
+    assert agent.to_fahrenheit(21.4) == 71
+    assert agent.to_fahrenheit(-40) == -40

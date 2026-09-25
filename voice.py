@@ -1,6 +1,6 @@
 """Platform configuration: voice, greeting, and platform-hosted tools.
 
-`get_weather` is declared here as a platform tool rather than as a LangChain
+`get_weather` is declared here as a platform tool rather than as an agent
 tool so that `reply()` can return speech in the same response as the tool call
 (`call_tool(..., saying=...)`). Tools that complete quickly belong in
 `agent.py` instead.
