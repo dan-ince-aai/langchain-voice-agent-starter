@@ -91,7 +91,6 @@ turns can reference earlier lookups without re-running them.
 | `ASSEMBLYAI_API_KEY` | required |
 | `MODEL` | `claude-haiku-4-5-20251001` |
 | `LLM_GATEWAY` | `https://llm-gateway.assemblyai.com/v1` (any OpenAI-compatible endpoint) |
-| `VOICE` | `alba` |
 | `PUBLIC_BASE_URL` | unset (ngrok) |
 | `TOOL_SECRET` | `local-dev-secret` |
 

@@ -13,7 +13,6 @@ from assemblyai_agents import VoiceAgent, tool
 from assemblyai_agents.models.rest import LlmConfigRequest
 
 SECRET = os.environ.get("TOOL_SECRET", "local-dev-secret")
-VOICE = os.environ.get("VOICE", "alba")
 
 
 @tool(timeout_seconds=15)
@@ -76,7 +75,7 @@ def build(base_url: str) -> VoiceAgent:
     auth = {"name": "Authorization", "value": f"Bearer {SECRET}"}
     return VoiceAgent(
         name="Weather Line",
-        voice=VOICE,
+        voice="alba",
         # Not used for generation: every turn is answered by agent.reply.
         system_prompt="You are a weather line.",
         greeting="Weather line, which place would you like?",
