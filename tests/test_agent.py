@@ -1,64 +1,127 @@
-"""End-to-end turns against the real model. Skipped without ASSEMBLYAI_API_KEY."""
+"""Validation and retry behaviour with the model replaced by `FunctionModel`.
 
-import json
-import os
+No API key or network required.
+"""
+
+import asyncio
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from assemblyai_agents.byo import Call, Say, Turn  # noqa: E402
-
 import agent  # noqa: E402
+from agent import Decision, audit  # noqa: E402
+from assemblyai_agents.byo import Say, Turn  # noqa: E402
+from pydantic_ai.messages import ModelResponse, ToolCallPart  # noqa: E402
+from pydantic_ai.models.function import FunctionModel  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not os.environ.get("ASSEMBLYAI_API_KEY"), reason="needs ASSEMBLYAI_API_KEY")
-
-LISBON = {"found": True, "place": "Lisbon", "country": "Portugal",
-          "celsius": 21.4, "wind_kph": 11.6, "description": "overcast"}
+LISBON = {"lisbon": {"found": True, "place": "Lisbon", "celsius": 21.4, "description": "overcast"}}
 
 
-def turn(messages) -> Turn:
+def turn(messages=None) -> Turn:
+    messages = messages or [{"role": "user", "content": "hi"}]
     return Turn.from_request({"model": "weather-line", "stream": True, "tools": [], "messages": messages})
 
 
-ASKED = [{"role": "user", "content": "what's the weather in Lisbon?"}]
-LOOKED_UP = ASKED + [
-    {"role": "assistant", "content": "Let me check Lisbon for you.",
-     "tool_calls": [{"id": "c1", "type": "function",
-                     "function": {"name": "get_weather", "arguments": '{"location": "Lisbon"}'}}]},
-    {"role": "tool", "tool_call_id": "c1", "content": json.dumps(LISBON)},
-]
+def scripted(*decisions):
+    """A model that returns the given Decisions in order, as structured output."""
+    queue = list(decisions)
+    calls = []
+
+    def model(messages, info):
+        calls.append(messages)
+        decision = queue.pop(0)
+        return ModelResponse(parts=[ToolCallPart(tool_name=info.output_tools[0].name, args=decision.model_dump())])
+
+    return FunctionModel(model), calls
 
 
-def test_named_place_produces_lookup_with_filler():
-    answer = agent.reply(turn(ASKED))
-
-    assert isinstance(answer, Call), answer
-    assert answer.name == "get_weather"
-    assert "lisbon" in answer.arguments["location"].lower()
-    assert "lisbon" in answer.saying.lower(), answer.saying
+# audit
 
 
-def test_lookup_result_produces_spoken_answer():
-    answer = agent.reply(turn(LOOKED_UP))
-
-    assert isinstance(answer, Say), answer
-    assert "lisbon" in answer.text.lower()
-    assert "overcast" in answer.text.lower() or "twenty" in answer.text.lower(), answer.text
+def test_temperature_without_lookup_is_rejected():
+    assert audit(Decision(action="speak", text="It's twenty degrees in Lisbon."), known={})
 
 
-def test_fahrenheit_is_answered_with_agent_tool():
-    answer = agent.reply(turn(LOOKED_UP + [
-        {"role": "assistant", "content": "It's overcast in Lisbon, twenty one degrees."},
-        {"role": "user", "content": "what's that in fahrenheit?"},
-    ]))
-
-    assert isinstance(answer, Say), answer
-    assert "71" in answer.text or "seventy" in answer.text.lower(), answer.text
+def test_temperature_with_lookup_is_accepted():
+    assert audit(Decision(action="speak", text="It's twenty-one degrees in Lisbon."), known=LISBON) == []
 
 
-def test_to_fahrenheit():
-    assert agent.to_fahrenheit(21.4) == 71
-    assert agent.to_fahrenheit(-40) == -40
+def test_known_place_is_not_looked_up_again():
+    assert audit(Decision(action="check_weather", location="Lisbon", filler="x"), known=LISBON)
+
+
+def test_new_place_is_looked_up():
+    assert audit(Decision(action="check_weather", location="Porto", filler="x"), known=LISBON) == []
+
+
+def test_missing_filler_is_defaulted():
+    proposal = Decision(action="check_weather", location="Lisbon")
+    assert audit(proposal, known={}) == []
+    assert "Lisbon" in proposal.filler
+
+
+def test_lookup_without_location_is_rejected():
+    assert audit(Decision(action="check_weather", location="  "), known={})
+
+
+def test_markdown_is_rejected():
+    assert audit(Decision(action="speak", text="**Lisbon**: overcast"), known=LISBON)
+
+
+def test_empty_text_is_rejected():
+    assert audit(Decision(action="speak", text=""), known={})
+
+
+# retry loop
+
+
+def test_rejected_output_is_retried():
+    model, calls = scripted(
+        Decision(action="speak", text="It's thirty degrees."),
+        Decision(action="speak", text="Which place would you like?"),
+    )
+    with agent.agent.override(model=model):
+        answer = agent.reply(turn())
+
+    assert isinstance(answer, Say) and answer.text == "Which place would you like?"
+    assert len(calls) == 2
+
+
+def test_rejection_reason_is_returned_to_the_model():
+    model, calls = scripted(
+        Decision(action="speak", text="It's thirty degrees."),
+        Decision(action="speak", text="Which place?"),
+    )
+    with agent.agent.override(model=model):
+        agent.reply(turn())
+
+    assert "nothing has been looked up" in str(calls[1])
+
+
+def test_exhausted_retries_fall_back():
+    model, calls = scripted(*[Decision(action="speak", text="It's thirty degrees.")] * (agent.RETRIES + 1))
+    with agent.agent.override(model=model):
+        answer = agent.reply(turn())
+
+    assert answer.text == agent.FALLBACK
+    assert len(calls) == agent.RETRIES + 1
+
+
+def test_model_exception_falls_back():
+    def broken(messages, info):
+        raise RuntimeError("gateway down")
+
+    with agent.agent.override(model=FunctionModel(broken)):
+        assert agent.reply(turn()).text == agent.FALLBACK
+
+
+def test_timeout_falls_back_within_budget(monkeypatch):
+    async def hung(messages, info):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(agent, "REPLY_BUDGET_SECONDS", 0.2)
+    with agent.agent.override(model=FunctionModel(hung)):
+        answer = agent.reply(turn())
+
+    assert answer.text == agent.FALLBACK

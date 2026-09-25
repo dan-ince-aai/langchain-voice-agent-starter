@@ -102,12 +102,13 @@ def main() -> int:
     from assemblyai_agents.serving import serve
 
     import agent
+    import gateway
     import voice
 
     with tunnel(PORT) as base_url:
         agent_id = deploy(base_url)
         secret = os.environ["TOOL_SECRET"]
-        print(f"model   {agent.MODEL} via {agent.GATEWAY}")
+        print(f"model   {gateway.MODEL} via {gateway.GATEWAY}")
         print(f"\nplayground: https://www.assemblyai.com/playground/voice-agent  (agent {agent_id})")
         print("local mic:  python call.py\n")
         serve(

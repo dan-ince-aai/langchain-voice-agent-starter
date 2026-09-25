@@ -1,4 +1,4 @@
-# pydantic-ai-voice-agent-starter
+# pydantic-agent-starter
 
 A PydanticAI agent answering a phone call through the AssemblyAI Voice Agents
 API. The platform handles speech-to-text, turn detection, barge-in,
@@ -35,20 +35,31 @@ headphones with `call.py`.
 
 ## Layout
 
+In reading order.
+
 | File | Purpose |
 | --- | --- |
-| `agent.py` | PydanticAI agent and the reply endpoint callback. |
+| `agent.py` | The agent. `reply()` at the top is what the platform calls. |
 | `voice.py` | Platform configuration: voice, greeting, platform tools. |
+| `gateway.py` | Model client for the AssemblyAI LLM gateway. |
 | `run.py` | Tunnel, create/update the agent, serve. |
 | `call.py` | Microphone client. |
 | `phone.py` | Phone numbers: `list`, `buy <country>`, `attach <number>`. |
-| `tests/` | `test_rules.py` runs offline; `test_agent.py` needs a key. |
+| `tests/test_agent.py` | Validation and retry behaviour. Offline. |
+| `tests/test_live.py` | Real turns against the model. Needs a key. |
 
 ## How it works
 
-The platform calls `POST /v1/chat/completions` on this process for every turn.
-`agent.reply(turn)` returns either `say(text)` or `call_tool(name, ...)`. This is
-the whole integration surface; the agent behind it can be anything.
+```
+caller ──audio──▶ AssemblyAI ──POST /v1/chat/completions──▶ agent.reply()
+                             ◀── say(...) | call_tool(...) ──
+                             ──POST /tools/get_weather─────▶ voice.get_weather()
+                             ◀── result ────────────────────
+                             ──POST /v1/chat/completions──▶ agent.reply()   (result in transcript)
+```
+
+`agent.reply(turn)` is the whole integration surface. It returns `say(text)`
+or `call_tool(name, ...)`; the agent behind it can be anything.
 
 `agent.py` is a PydanticAI `Agent` with `output_type=Decision`, one tool
 (`to_fahrenheit`), and an output validator:
@@ -82,9 +93,8 @@ turns can reference earlier lookups without re-running them.
 ### Gateway response shape
 
 The AssemblyAI LLM gateway omits `id` and `object` and passes the upstream
-`finish_reason` through. PydanticAI validates the full response, so `agent.py`
-installs an `httpx2` transport that fills those fields in. It is inert against
-an endpoint that already returns them.
+`finish_reason` through. PydanticAI validates the full response, so
+`gateway.py` installs an `httpx2` transport that fills those fields in.
 
 ## Configuration
 
@@ -99,8 +109,8 @@ an endpoint that already returns them.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q tests/test_rules.py   # offline
-.venv/bin/python -m pytest -q                       # includes model-backed turns
+.venv/bin/python -m pytest -q tests/test_agent.py   # offline
+.venv/bin/python -m pytest -q                       # includes tests/test_live.py
 ```
 
 ## Notes
